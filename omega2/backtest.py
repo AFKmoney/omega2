@@ -96,7 +96,7 @@ class Backtester:
         initial = equity
         equity_curve = []
         trades: List[BacktestTrade] = []
-        open_pos = None
+        open_positions: List[tuple] = []  # multiple positions allowed (was single open_pos)
         rng = np.random.default_rng(42)
         wins = 0
         crowd_engine = CrowdEngine(symbols=(symbol,))
@@ -146,66 +146,55 @@ class Backtester:
 
             crowd = crowd_engine.compute(symbol, str(i))
 
-            # === SIGNAL QUALITY SCORING ===
-            # Score 0-10 based on multiple confluences. Only trade if score >= 5.
+            # === SIGNAL QUALITY — 2 STRATEGIES ONLY (trend + crowd) ===
+            # meanrev and breakout were tested and dilute win rate. Cut.
             quality_score = 0
             all_signals = []
 
-            # Crowd signal
+            # Crowd signal (contrarian)
             if crowd:
                 csigs = contrarian.on_crowd(crowd)
                 if csigs:
-                    quality_score += 3  # crowd extreme = strong
+                    quality_score += 3
                     all_signals.extend(csigs)
 
-            # Momentum with ATR-relative threshold
-            if open_pos is None:
+            # Trend follow (ATR-relative, volume confirmed, WITH trend only)
+            if len(open_positions) < 2:
                 ret_5 = (prices[i] - prices[i-5]) / prices[i-5] if i >= 5 else 0
-                mean_20 = np.mean(prices[max(0, i-20):i+1])
-                dev = (price - mean_20) / mean_20
-                # Threshold = 3x ATR (adapts to vol — high vol = higher threshold)
-                entry_threshold = current_atr_bps * 3 / 10000  # 3 ATR units
+                entry_threshold = current_atr_bps * 2.5 / 10000
                 if i >= 50:
                     trend_50 = (prices[i] - prices[i-50]) / prices[i-50]
                 else:
                     trend_50 = 0
                 vol_avg = np.mean(volumes[max(0,i-20):i]) if i >= 20 else volumes[i]
-                vol_confirm = volumes[i] > vol_avg * 1.3
+                vol_confirm = volumes[i] > vol_avg * 1.2
 
-                if abs(ret_5) > entry_threshold or abs(dev) > entry_threshold * 1.5:
-                    side = Side.BUY if (ret_5 > entry_threshold or dev < -entry_threshold * 1.5) else Side.SELL
-                    if side == Side.BUY and trend_50 < -0.02: pass
-                    elif side == Side.SELL and trend_50 > 0.02: pass
-                    elif not vol_confirm: pass
-                    else:
-                        quality_score += 2  # momentum confirmed
-                        # DYNAMIC TP/SL scaled to ATR
-                        dyn_sl = max(80, current_atr_bps * 1.5)   # 1.5x ATR
-                        dyn_tp = dyn_sl * 2.5                      # 2.5:1 R/R
+                if abs(ret_5) > entry_threshold and vol_confirm:
+                    side = Side.BUY if ret_5 > 0 else Side.SELL
+                    # ONLY trade WITH the 50-bar trend (strict)
+                    if (side == Side.BUY and trend_50 > 0) or (side == Side.SELL and trend_50 < 0):
+                        quality_score += 2
+                        dyn_sl = max(60, current_atr_bps * 1.5)
+                        dyn_tp = dyn_sl * 2.5
                         all_signals.append(Signal(
-                            agent="bt_momentum", symbol=symbol, timestamp=str(i),
-                            side=side, confidence=0.60 + min(0.15, quality_score * 0.02),
+                            agent="trend", symbol=symbol, timestamp=str(i),
+                            side=side, confidence=0.62 + min(0.12, quality_score * 0.02),
                             stop_loss_bps=dyn_sl, take_profit_bps=dyn_tp,
                         ))
 
-            # Only trade high-quality setups (score >= 4)
-            if quality_score < 3 and not all_signals:
-                pass  # skip low quality
-
-            # === MANAGE OPEN POSITION with ATR-dynamic exits ===
-            if open_pos:
-                entry_bar = open_pos[0]; side = open_pos[1]; qty = open_pos[2]
-                entry_price = open_pos[3]
-                # Dynamic exits based on entry-time ATR
-                entry_atr = open_pos[5] if len(open_pos) > 5 else 100
-                dyn_tp = entry_atr * 3.75   # 1.5 ATR stop × 2.5 = 3.75 ATR target
+            # === MANAGE OPEN POSITIONS with ATR-dynamic exits ===
+            still_open = []
+            for pos in open_positions:
+                entry_bar = pos[0]; side = pos[1]; qty = pos[2]
+                entry_price = pos[3]
+                entry_atr = pos[5] if len(pos) > 5 else 100
+                dyn_tp = entry_atr * 3.75
                 dyn_sl = entry_atr * 1.5
                 bars_held = i - entry_bar
                 direction = 1.0 if side == "BUY" else -1.0
                 pnl_bps = direction * (price - entry_price) / entry_price * 10000
-                max_fav = max(open_pos[4] if len(open_pos) > 4 else 0, pnl_bps)
-                open_pos = (entry_bar, side, qty, entry_price, max_fav, entry_atr)
-                # Trailing: if >2 ATR profit and gave back >50%
+                max_fav = max(pos[4] if len(pos) > 4 else 0, pnl_bps)
+                pos = (entry_bar, side, qty, entry_price, max_fav, entry_atr)
                 trailing_exit = max_fav > entry_atr * 2 and pnl_bps < max_fav * 0.5
                 if pnl_bps >= dyn_tp or pnl_bps <= -dyn_sl or bars_held >= 90 or trailing_exit:
                     slip = self.slippage_bps + rng.normal(0, 3)
@@ -223,25 +212,27 @@ class Backtester:
                         slippage_bps=slip, holding_bars=bars_held))
                     risk.on_trade_closed(pnl_bps_net, pnl_usd)
                     risk.portfolio_heat.close(symbol)
-                    open_pos = None
+                else:
+                    still_open.append(pos)
+            open_positions = still_open
 
             # === EXECUTE SIGNALS ===
-            if open_pos is None and all_signals:
+            if len(open_positions) < 2 and all_signals:
                 for signal in all_signals:
                     order = risk.on_signal(signal, price)
                     if order:
                         slip = self.slippage_bps + rng.normal(0, 3)
                         fill_price = price * (1 + slip / 10000 * (1 if signal.side == Side.BUY else -1))
                         fee = order.qty * fill_price * self.taker_fee / 10000
-                        open_pos = (i, signal.side.value, order.qty, fill_price, 0, current_atr_bps)
+                        open_positions.append((i, signal.side.value, order.qty, fill_price, 0, current_atr_bps))
                         equity -= fee
                         break
 
             equity_curve.append(equity)
 
-        # Close any remaining position
-        if open_pos:
-            entry_bar = open_pos[0]; side = open_pos[1]; qty = open_pos[2]; entry_price = open_pos[3]
+        # Close any remaining positions
+        for pos in open_positions:
+            entry_bar = pos[0]; side = pos[1]; qty = pos[2]; entry_price = pos[3]
             price = prices[-1]
             direction = 1.0 if side == "BUY" else -1.0
             pnl_usd = direction * (price - entry_price) * qty
