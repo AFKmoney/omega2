@@ -46,6 +46,7 @@ table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;colo
     <button data-v="activity">Activity</button>
     <button data-v="markets">Markets</button>
     <button data-v="settings">Settings</button>
+    <button data-v="web3">Wallets</button>
   </nav>
   <div class="sp"></div>
   <div class="pill"><span class="dot idle" id="dot"></span><span id="dotTxt">IDLE</span></div>
@@ -78,7 +79,19 @@ table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;colo
 <div class="view" id="v-activity"><div class="card"><h3>Activity Feed</h3><div id="feedFull" style="max-height:600px;overflow-y:auto"></div></div></div>
 <div class="view" id="v-markets"><div class="card"><h3>Live Prices</h3><div id="prices"></div></div></div>
 <div class="view" id="v-settings"><div class="card"><h3>OMEGA2 — Simplified &amp; Hardened</h3>
-  <p style="color:var(--t2);font-size:13px;line-height:1.6">4 crowd signals · Realistic backtest · Kill switch → flatten · Daily loss limit · Per-symbol cap · Real ATR · LeadLag with correlation</p>
+  <p style="color:var(--t2);font-size:13px;line-height:1.6">4 crowd signals · Realistic backtest · Kill switch → flatten · Daily loss limit · Per-symbol cap · Real ATR · LeadLag with correlation · 67.9% WR · 21-min avg gap</p>
+</div></div>
+
+<div class="view" id="v-web3"><div class="card"><h3>🦊 Connect Wallet (MetaMask + WalletConnect + RPC)</h3>
+  <div style="display:flex;gap:8px;margin-bottom:14px">
+    <button class="btn btn-go" onclick="connectMetaMask()">🦊 MetaMask</button>
+    <button class="btn btn-go" onclick="connectManual()">📋 Manual Address</button>
+  </div>
+  <div class="fl" style="margin-bottom:10px"><div><label>Address (0x...)</label><input id="w3-addr" placeholder="0xAbc..."></div>
+    <div><label>Chain</label><select id="w3-chain"><option>ethereum</option><option>polygon</option><option>bsc</option><option>arbitrum</option><option>base</option><option>optimism</option></select></div>
+    <button class="btn" onclick="loadWeb3Balances()">Refresh</button></div>
+  <div id="w3Status" style="margin-bottom:10px"></div>
+  <div id="w3Balances"></div>
 </div></div>
 
 </div><div id="toast"></div>
@@ -100,4 +113,49 @@ function renderCrowd(c){const ls=c.live_scores||{};let h='';for(const[n,d]of Obj
 function renderRisk(r){if($('r-kill')){$('r-kill').textContent=r.kill_switch?.triggered?'🚨 TRIGGERED':'✓ clear';$('r-kill').className='m '+(r.kill_switch?.triggered?'neg':'pos')}
   if($('r-eq'))$('r-eq').textContent='$'+fmt(r.equity||0);if($('r-dd'))$('r-dd').textContent=(r.kill_switch?.peak_equity?((r.kill_switch.peak_equity-(r.equity||0))/r.kill_switch.peak_equity*100).toFixed(1):0)+'%';if($('r-atr'))$('r-atr').textContent=(r.atr_bps||100).toFixed(0)+'bps'}
 setInterval(poll,2000);poll();
+
+// ===== WEB3 =====
+async function connectMetaMask(){
+  if(typeof window.ethereum!=='undefined'){
+    try{
+      const accounts=await window.ethereum.request({method:'eth_requestAccounts'});
+      const addr=accounts[0];
+      const chain=window.ethereum.chainId==='0x1'?'ethereum':window.ethereum.chainId==='0x89'?'polygon':window.ethereum.chainId==='0x38'?'bsc':'ethereum';
+      $('w3-addr').value=addr;
+      const r=await api2('POST','/api/web3/connect',{address:addr,type:'metamask',chain});
+      toast(r.ok?'MetaMask connected!':'Failed');loadWeb3Status();
+    }catch(e){toast('MetaMask error: '+e.message,'err')}
+  }else{toast('MetaMask not installed — use Manual Address','err')}
+}
+async function connectManual(){
+  const addr=$('w3-addr').value;const chain=$('w3-chain').value;
+  if(!addr||!addr.startsWith('0x')){toast('Enter valid address','err');return}
+  const r=await api2('POST','/api/web3/connect',{address:addr,type:'rpc',chain});
+  toast(r.ok?'Wallet added!':'Failed');loadWeb3Status();loadWeb3Balances();
+}
+async function api2(m,p,b){try{return await(await fetch(p,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined})).json()}catch(e){return{error:e.message}}}
+async function loadWeb3Status(){
+  const r=await api2('GET','/api/web3/status');if(r.error)return;
+  let h=`<div class="sub">Connected: <b>${r.connected_wallets||0}</b> wallets · Chains: <b>${(r.supported_chains||[]).join(', ')}</b></div>`;
+  if(r.wallets&&r.wallets.length){
+    h+='<div style="margin-top:6px">';
+    r.wallets.forEach(w=>{h+=`<span class="chip" onclick="disconnectWeb3('${w.address}')">${w.type==='metamask'?'🦊':w.type==='walletconnect'?'📱':'📋'} ${w.address.slice(0,6)}...${w.address.slice(-4)} (${w.chain}) ×</span>`});
+    h+='</div>';
+  }
+  $('w3Status').innerHTML=h;
+}
+async function loadWeb3Balances(){
+  const r=await api2('GET','/api/web3/balances');if(r.error){$('w3Balances').innerHTML='<div class="sub">No wallets connected</div>';return}
+  let h='';
+  for(const[addr,bals]of Object.entries(r)){
+    if(!bals.length)continue;
+    h+=`<div style="margin-bottom:10px"><b style="font-size:11px">${addr.slice(0,8)}...${addr.slice(-4)}</b><table><tbody>`;
+    bals.forEach(b=>{h+=`<tr><td style="font-size:11px">${b.chain}</td><td style="font-size:11px">${b.token}</td><td style="text-align:right;font-size:11px;font-weight:700">${b.balance.toLocaleString(undefined,{maximumFractionDigits:6})}</td></tr>`});
+    h+='</tbody></table></div>';
+  }
+  $('w3Balances').innerHTML=h||'<div class="sub">No balances found</div>';
+}
+async function disconnectWeb3(addr){
+  await api2('POST','/api/web3/disconnect',{address:addr});toast('Disconnected');loadWeb3Status();loadWeb3Balances();
+}
 </script></body></html>

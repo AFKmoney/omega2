@@ -15,6 +15,7 @@ from aiohttp import web, WSMsgType
 
 from omega2.core import load_config, get_logger
 from omega2.orchestrator import Orchestrator
+from omega2.web3 import Web3Manager
 
 logger = get_logger("omega2.web")
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -25,6 +26,7 @@ class WebServer:
         self.port = port
         self.app = web.Application()
         self._orch: Optional[Orchestrator] = None
+        self._web3 = Web3Manager()
         self._setup()
 
     @property
@@ -42,6 +44,11 @@ class WebServer:
         self.app.router.add_post("/api/trading/start", self._start)
         self.app.router.add_post("/api/trading/stop", self._stop)
         self.app.router.add_get("/api/markets", self._markets)
+        # Web3
+        self.app.router.add_get("/api/web3/status", self._web3_status)
+        self.app.router.add_post("/api/web3/connect", self._web3_connect)
+        self.app.router.add_post("/api/web3/disconnect", self._web3_disconnect)
+        self.app.router.add_get("/api/web3/balances", self._web3_balances)
 
     async def _index(self, req):
         f = _STATIC / "index.html"
@@ -65,9 +72,37 @@ class WebServer:
         return web.json_response({"ok": True})
 
     async def _markets(self, req):
-        # Simplified — just return BTC price
         prices = self.orch.risk.portfolio_heat.last_prices
         return web.json_response({"prices": prices})
+
+    # ===== WEB3 =====
+    async def _web3_status(self, req):
+        return web.json_response(self._web3.stats())
+
+    async def _web3_connect(self, req):
+        data = await req.json()
+        addr = data.get("address", "")
+        wallet_type = data.get("type", "rpc")
+        chain = data.get("chain", "ethereum")
+        ok = await self._web3.connect(addr, wallet_type, chain)
+        return web.json_response({"ok": ok, "wallets": self._web3.list_wallets()})
+
+    async def _web3_disconnect(self, req):
+        data = await req.json()
+        ok = self._web3.disconnect(data.get("address", ""))
+        return web.json_response({"ok": ok})
+
+    async def _web3_balances(self, req):
+        addr = req.query.get("address", "")
+        chain = req.query.get("chain", "ethereum")
+        if not addr:
+            all_balances = await self._web3.get_all_wallets_balances()
+            return web.json_response(all_balances)
+        bals = await self._web3.get_all_balances(addr, chain)
+        return web.json_response([
+            {"chain": b.chain, "token": b.token, "balance": b.balance, "contract": b.contract}
+            for b in bals
+        ])
 
     async def run(self):
         runner = web.AppRunner(self.app)
