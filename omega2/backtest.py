@@ -161,26 +161,51 @@ class Backtester:
                 csigs = contrarian.on_crowd(crowd)
                 all_signals.extend(csigs)
 
-            # Momentum fallback (lower confidence, always present)
+            # Momentum fallback with VOLUME CONFIRMATION
+            # (was entering on price only → too many false signals)
             if open_pos is None and not all_signals:
                 ret_5 = (prices[i] - prices[i-5]) / prices[i-5] if i >= 5 else 0
                 mean_20 = np.mean(prices[max(0, i-20):i+1])
                 dev = (price - mean_20) / mean_20
-                if abs(ret_5) > 0.003 or abs(dev) > 0.005:
-                    side = Side.BUY if (ret_5 > 0.003 or dev < -0.005) else Side.SELL
-                    all_signals.append(Signal(
-                        agent="bt_momentum", symbol=symbol, timestamp=str(i),
-                        side=side, confidence=0.55,
-                        stop_loss_bps=80, take_profit_bps=200,
-                    ))
+                # Volume confirmation: current vol > 1.3x average
+                vol_avg = np.mean(volumes[max(0,i-20):i]) if i >= 20 else volumes[i]
+                vol_confirm = volumes[i] > vol_avg * 1.3
+                # Trend filter: only trade in direction of 50-bar trend
+                if i >= 50:
+                    trend_50 = (prices[i] - prices[i-50]) / prices[i-50]
+                else:
+                    trend_50 = 0
+                if abs(ret_5) > 0.012 or abs(dev) > 0.015:  # p90 threshold (was 0.004 = noise)
+                    side = Side.BUY if (ret_5 > 0.012 or dev < -0.015) else Side.SELL
+                    # Skip if counter-trend on a strong 50-bar trend
+                    if side == Side.BUY and trend_50 < -0.02: pass  # don't fight strong downtrend
+                    elif side == Side.SELL and trend_50 > 0.02: pass  # don't fight strong uptrend
+                    elif not vol_confirm: pass  # no volume = no conviction
+                    else:
+                        all_signals.append(Signal(
+                            agent="bt_momentum", symbol=symbol, timestamp=str(i),
+                            side=side, confidence=0.62,
+                            stop_loss_bps=200, take_profit_bps=500,  # calibrated: 2.5:1 R/R
+                        ))
 
             # === MANAGE OPEN POSITION ===
             if open_pos:
-                entry_bar, side, qty, entry_price = open_pos
+                entry_bar = open_pos[0]
+                side = open_pos[1]
+                qty = open_pos[2]
+                entry_price = open_pos[3]
                 bars_held = i - entry_bar
                 direction = 1.0 if side == "BUY" else -1.0
                 pnl_bps = direction * (price - entry_price) / entry_price * 10000
-                if pnl_bps >= 200 or pnl_bps <= -80 or bars_held >= 60:
+                max_fav = max(open_pos[4] if len(open_pos) > 4 else 0, pnl_bps)
+                if len(open_pos) > 4:
+                    open_pos = (entry_bar, side, qty, entry_price, max_fav)
+                else:
+                    open_pos = (entry_bar, side, qty, entry_price, max_fav)
+                # Dynamic exit: TP, SL, trailing stop, or time
+                # Trailing: if we had >200bps profit and now <50% remains → exit
+                trailing_exit = max_fav > 250 and pnl_bps < max_fav * 0.4
+                if pnl_bps >= 500 or pnl_bps <= -200 or bars_held >= 90 or trailing_exit:
                     slip = self.slippage_bps + rng.normal(0, 3)
                     exit_price = price * (1 - slip / 10000 * direction)
                     fee = qty * exit_price * self.taker_fee / 10000
@@ -207,7 +232,7 @@ class Backtester:
                         slip = self.slippage_bps + rng.normal(0, 3)
                         fill_price = price * (1 + slip / 10000 * (1 if signal.side == Side.BUY else -1))
                         fee = order.qty * fill_price * self.taker_fee / 10000
-                        open_pos = (i, signal.side.value, order.qty, fill_price)
+                        open_pos = (i, signal.side.value, order.qty, fill_price, 0)  # 5th = max_fav
                         equity -= fee
                         break  # one position at a time in backtest
 
@@ -215,7 +240,7 @@ class Backtester:
 
         # Close any remaining position
         if open_pos:
-            entry_bar, side, qty, entry_price = open_pos
+            entry_bar = open_pos[0]; side = open_pos[1]; qty = open_pos[2]; entry_price = open_pos[3]
             price = prices[-1]
             direction = 1.0 if side == "BUY" else -1.0
             pnl_usd = direction * (price - entry_price) * qty
