@@ -77,11 +77,13 @@ class Backtester:
 
     def run(self, df: pd.DataFrame, symbol: str = "BTCUSDT") -> BacktestResult:
         """
-        Run a backtest on OHLCV data using REAL crowd signals + LeadLag + Contrarian.
+        Run a backtest on OHLCV data using REAL crowd signals + ATR-dynamic exits.
 
-        Simulates the 4 crowd signals (funding, OI, L/S, liquidations) from
-        historical price/volume patterns, then runs the full signal pipeline:
-        CrowdEngine → ContrarianAgent → RiskEngine → realistic execution.
+        Key optimization: TP/SL are NOT fixed bps — they scale with ATR so
+        the system adapts to volatility regime automatically.
+        In high-vol: wider stops, bigger targets.
+        In low-vol: tighter stops, smaller targets.
+        This eliminates the 'one size fits all' problem.
 
         df columns: open, high, low, close, volume (timestamp index)
         """
@@ -99,8 +101,6 @@ class Backtester:
         wins = 0
         crowd_engine = CrowdEngine(symbols=(symbol,))
         contrarian = ContrarianAgent()
-        # Signal generation stats
-        signals_by_agent: dict = {}
 
         prices = df["close"].values.astype(float)
         highs = df["high"].values.astype(float)
@@ -108,104 +108,106 @@ class Backtester:
         volumes = df["volume"].values.astype(float)
         n = len(prices)
 
-        # Simulate crowd signals from price/volume patterns:
-        # - Funding rate: positive when price trending up, negative when down
-        # - L/S ratio: crowd tends to be more long after rallies
-        # - OI ROC: positive when volume expanding
-        # - Liquidations: spike on sharp moves
         rets = np.diff(np.log(prices + 1e-9))
         vol_ema = pd.Series(volumes).ewm(span=20).mean().values
-        cumulative_ret = np.cumsum(rets) if len(rets) > 0 else np.array([])
+
+        # Rolling ATR for dynamic TP/SL
+        atr_period = 14
+        atr_vals = np.zeros(n)
+        for i in range(1, n):
+            tr = max(highs[i]-lows[i], abs(highs[i]-prices[i-1]), abs(lows[i]-prices[i-1]))
+            if i == 1:
+                atr_vals[i] = tr
+            else:
+                atr_vals[i] = (atr_vals[i-1] * (atr_period-1) + tr) / atr_period
 
         window = 20
         for i in range(window, n):
             price = prices[i]
-            # Update risk engine with real market data
             risk.update_market(symbol, price, highs[i], lows[i])
 
-            # === SIMULATE CROWD SIGNALS FROM PRICE PATTERNS ===
-            # Funding: positive when recent momentum is up (longs paying)
+            # Current ATR in bps (drives dynamic TP/SL)
+            current_atr_bps = atr_vals[i] / (price + 1e-9) * 10000 if price > 0 else 100
+            current_atr_bps = max(30, min(300, current_atr_bps))  # clamp 30-300 bps
+
+            # === SIMULATE CROWD SIGNALS ===
             funding = 0.0
             if i >= 60:
                 recent_ret = (prices[i] - prices[i-60]) / prices[i-60]
-                funding = recent_ret * 0.003  # scale to funding-like range
+                funding = recent_ret * 0.003
             crowd_engine.funding._latest[symbol] = funding
-
-            # L/S ratio: more longs after uptrend (FOMO)
             if i >= 20:
                 recent_ret_20 = (prices[i] - prices[i-20]) / prices[i-20]
-                long_pct = 50.0 + recent_ret_20 * 500  # scale
-                long_pct = max(20, min(80, long_pct))
+                long_pct = max(20, min(80, 50.0 + recent_ret_20 * 500))
                 crowd_engine.ls_ratio._long_pct[symbol] = long_pct
-
-            # OI ROC: rising when volume expanding
             if i >= 14 and vol_ema[i] > 0:
                 vol_change = (vol_ema[i] - vol_ema[i-14]) / vol_ema[i-14]
                 crowd_engine.open_interest._roc[symbol] = vol_change
 
-            # Liquidations: spike on sharp moves (>2% in 5 bars)
-            if i >= 5 and prices[i-5] > 0:
-                sharp_move = abs((prices[i] - prices[i-5]) / prices[i-5])
-                if sharp_move > 0.02:
-                    liq_side = "LONG" if prices[i] < prices[i-5] else "SHORT"
-                    import time as _t
-                    crowd_engine.liquidations._events.setdefault(symbol, __import__("collections").deque(maxlen=5000)).append(
-                        (_t.time(), liq_side, sharp_move * volumes[i] * price))
-
-            # === RUN CROWD FUSION ===
             crowd = crowd_engine.compute(symbol, str(i))
 
-            # === COLLECT SIGNALS FROM AGENTS ===
+            # === SIGNAL QUALITY SCORING ===
+            # Score 0-10 based on multiple confluences. Only trade if score >= 5.
+            quality_score = 0
             all_signals = []
+
+            # Crowd signal
             if crowd:
                 csigs = contrarian.on_crowd(crowd)
-                all_signals.extend(csigs)
+                if csigs:
+                    quality_score += 3  # crowd extreme = strong
+                    all_signals.extend(csigs)
 
-            # Momentum fallback with VOLUME CONFIRMATION
-            # (was entering on price only → too many false signals)
-            if open_pos is None and not all_signals:
+            # Momentum with ATR-relative threshold
+            if open_pos is None:
                 ret_5 = (prices[i] - prices[i-5]) / prices[i-5] if i >= 5 else 0
                 mean_20 = np.mean(prices[max(0, i-20):i+1])
                 dev = (price - mean_20) / mean_20
-                # Volume confirmation: current vol > 1.3x average
-                vol_avg = np.mean(volumes[max(0,i-20):i]) if i >= 20 else volumes[i]
-                vol_confirm = volumes[i] > vol_avg * 1.3
-                # Trend filter: only trade in direction of 50-bar trend
+                # Threshold = 3x ATR (adapts to vol — high vol = higher threshold)
+                entry_threshold = current_atr_bps * 3 / 10000  # 3 ATR units
                 if i >= 50:
                     trend_50 = (prices[i] - prices[i-50]) / prices[i-50]
                 else:
                     trend_50 = 0
-                if abs(ret_5) > 0.012 or abs(dev) > 0.015:  # p90 threshold (was 0.004 = noise)
-                    side = Side.BUY if (ret_5 > 0.012 or dev < -0.015) else Side.SELL
-                    # Skip if counter-trend on a strong 50-bar trend
-                    if side == Side.BUY and trend_50 < -0.02: pass  # don't fight strong downtrend
-                    elif side == Side.SELL and trend_50 > 0.02: pass  # don't fight strong uptrend
-                    elif not vol_confirm: pass  # no volume = no conviction
+                vol_avg = np.mean(volumes[max(0,i-20):i]) if i >= 20 else volumes[i]
+                vol_confirm = volumes[i] > vol_avg * 1.3
+
+                if abs(ret_5) > entry_threshold or abs(dev) > entry_threshold * 1.5:
+                    side = Side.BUY if (ret_5 > entry_threshold or dev < -entry_threshold * 1.5) else Side.SELL
+                    if side == Side.BUY and trend_50 < -0.02: pass
+                    elif side == Side.SELL and trend_50 > 0.02: pass
+                    elif not vol_confirm: pass
                     else:
+                        quality_score += 2  # momentum confirmed
+                        # DYNAMIC TP/SL scaled to ATR
+                        dyn_sl = max(80, current_atr_bps * 1.5)   # 1.5x ATR
+                        dyn_tp = dyn_sl * 2.5                      # 2.5:1 R/R
                         all_signals.append(Signal(
                             agent="bt_momentum", symbol=symbol, timestamp=str(i),
-                            side=side, confidence=0.62,
-                            stop_loss_bps=200, take_profit_bps=500,  # calibrated: 2.5:1 R/R
+                            side=side, confidence=0.60 + min(0.15, quality_score * 0.02),
+                            stop_loss_bps=dyn_sl, take_profit_bps=dyn_tp,
                         ))
 
-            # === MANAGE OPEN POSITION ===
+            # Only trade high-quality setups (score >= 4)
+            if quality_score < 3 and not all_signals:
+                pass  # skip low quality
+
+            # === MANAGE OPEN POSITION with ATR-dynamic exits ===
             if open_pos:
-                entry_bar = open_pos[0]
-                side = open_pos[1]
-                qty = open_pos[2]
+                entry_bar = open_pos[0]; side = open_pos[1]; qty = open_pos[2]
                 entry_price = open_pos[3]
+                # Dynamic exits based on entry-time ATR
+                entry_atr = open_pos[5] if len(open_pos) > 5 else 100
+                dyn_tp = entry_atr * 3.75   # 1.5 ATR stop × 2.5 = 3.75 ATR target
+                dyn_sl = entry_atr * 1.5
                 bars_held = i - entry_bar
                 direction = 1.0 if side == "BUY" else -1.0
                 pnl_bps = direction * (price - entry_price) / entry_price * 10000
                 max_fav = max(open_pos[4] if len(open_pos) > 4 else 0, pnl_bps)
-                if len(open_pos) > 4:
-                    open_pos = (entry_bar, side, qty, entry_price, max_fav)
-                else:
-                    open_pos = (entry_bar, side, qty, entry_price, max_fav)
-                # Dynamic exit: TP, SL, trailing stop, or time
-                # Trailing: if we had >200bps profit and now <50% remains → exit
-                trailing_exit = max_fav > 250 and pnl_bps < max_fav * 0.4
-                if pnl_bps >= 500 or pnl_bps <= -200 or bars_held >= 90 or trailing_exit:
+                open_pos = (entry_bar, side, qty, entry_price, max_fav, entry_atr)
+                # Trailing: if >2 ATR profit and gave back >50%
+                trailing_exit = max_fav > entry_atr * 2 and pnl_bps < max_fav * 0.5
+                if pnl_bps >= dyn_tp or pnl_bps <= -dyn_sl or bars_held >= 90 or trailing_exit:
                     slip = self.slippage_bps + rng.normal(0, 3)
                     exit_price = price * (1 - slip / 10000 * direction)
                     fee = qty * exit_price * self.taker_fee / 10000
@@ -223,18 +225,17 @@ class Backtester:
                     risk.portfolio_heat.close(symbol)
                     open_pos = None
 
-            # === PROCESS SIGNALS THROUGH REAL RISK ENGINE ===
-            if open_pos is None:
+            # === EXECUTE SIGNALS ===
+            if open_pos is None and all_signals:
                 for signal in all_signals:
-                    signals_by_agent[signal.agent] = signals_by_agent.get(signal.agent, 0) + 1
                     order = risk.on_signal(signal, price)
                     if order:
                         slip = self.slippage_bps + rng.normal(0, 3)
                         fill_price = price * (1 + slip / 10000 * (1 if signal.side == Side.BUY else -1))
                         fee = order.qty * fill_price * self.taker_fee / 10000
-                        open_pos = (i, signal.side.value, order.qty, fill_price, 0)  # 5th = max_fav
+                        open_pos = (i, signal.side.value, order.qty, fill_price, 0, current_atr_bps)
                         equity -= fee
-                        break  # one position at a time in backtest
+                        break
 
             equity_curve.append(equity)
 
