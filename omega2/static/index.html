@@ -236,7 +236,9 @@ label{font-size:8px;color:var(--t3);display:block;margin-bottom:4px;text-transfo
   <div class="fl"><div><label>Address (0x...)</label><input id="w3a" placeholder="0xAbc..."></div>
     <div><label>Chain</label><select id="w3c"><option>ethereum</option><option>polygon</option><option>bsc</option><option>arbitrum</option><option>base</option><option>optimism</option></select></div>
     <button class="btn" onclick="loadW3B()">Refresh</button></div>
-  <div id="w3s" style="margin-bottom:10px"></div><div id="w3b"></div>
+  <div id="w3s" style="margin-bottom:10px"></div>
+  <div id="w3scan" style="margin-bottom:10px"></div>
+  <div id="w3b"></div>
 </div></div>
 
 <!-- SETTINGS -->
@@ -383,6 +385,8 @@ async function connectMM(){
       $('w3a').value=a[0];
       const r=await api('POST','/api/web3/connect',{address:a[0],type:'metamask',chain:'ethereum'});
       toast(r.ok?'MetaMask connected!':'Failed');loadW3S();loadW3B();
+      // AUTO-SCAN: discover all tokens across all chains
+      autoScan(a[0]);
     }catch(e){toast('MetaMask: '+e.message,'err')}
   }else{toast('Install MetaMask or use Manual','err')}
 }
@@ -390,6 +394,34 @@ async function connectMan(){
   const a=$('w3a').value;if(!a||!a.startsWith('0x')){toast('Enter valid address','err');return}
   const r=await api('POST','/api/web3/connect',{address:a,type:'rpc',chain:$('w3c').value});
   toast(r.ok?'Connected!':'Failed');loadW3S();loadW3B();
+  // AUTO-SCAN
+  autoScan(a);
+}
+// === AUTO WALLET SCANNER ===
+async function autoScan(addr){
+  if($('w3scan'))$('w3scan').innerHTML='<div class="fi"><span class="spin"></span> Scanning all chains for tokens…</div>';
+  const r=await api('GET','/api/wallet/scan?address='+addr);
+  if(r.error){$('w3scan').innerHTML='<div class="sub">Scan failed</div>';return}
+  let h=`<div style="margin-bottom:8px;padding:8px;background:rgba(0,224,255,.06);border-radius:8px">
+    <b style="font-size:12px">🔍 Found ${r.total_tokens} tokens · Total: $${fmt(r.total_usd_value)}</b></div>`;
+  h+='<table><thead><tr><th>Chain</th><th>Token</th><th>Balance</th><th>USD</th><th>Trade?</th><th>Score</th></tr></thead><tbody>';
+  r.holdings.forEach(t=>{
+    const tr=t.tradeable?'<span class="tag BUY">✓</span>':'<span style="color:var(--t3)">—</span>';
+    h+=`<tr><td style="font-size:10px">${t.chain}</td><td><b>${t.symbol}</b></td>
+    <td>${t.balance}</td><td>$${fmt(t.usd_value)}</td><td>${tr}</td>
+    <td style="font-size:10px;color:${t.rank_score>20?'var(--cy)':'var(--t3)'}">${t.rank_score}</td></tr>`;
+  });
+  h+='</tbody></table>';
+  // Show top trade targets
+  const tg=await api('GET','/api/wallet/targets?address='+addr);
+  if(tg.targets&&tg.targets.length){
+    h+='<div style="margin-top:10px;padding:8px;background:rgba(0,240,160,.06);border-radius:8px">';
+    h+=`<b style="font-size:12px">🎯 Best trade targets:</b><br>`;
+    tg.targets.forEach(t=>{h+=`<span class="chip" style="background:var(--grd)">${t.symbol} ($${fmt(t.usd_value)}) score=${t.rank_score}</span>`});
+    h+='</div>';
+  }
+  if($('w3scan'))$('w3scan').innerHTML=h;
+  toast(`Scan complete: ${r.total_tokens} tokens found!`);
 }
 async function loadW3S(){
   const r=await api('GET','/api/web3/status');if(r.error)return;

@@ -16,6 +16,7 @@ from aiohttp import web, WSMsgType
 from omega2.core import load_config, get_logger
 from omega2.orchestrator import Orchestrator
 from omega2.web3 import Web3Manager
+from omega2.wallet_scanner import WalletScanner
 
 logger = get_logger("omega2.web")
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -27,6 +28,7 @@ class WebServer:
         self.app = web.Application()
         self._orch: Optional[Orchestrator] = None
         self._web3 = Web3Manager()
+        self._scanner = WalletScanner()
         self._setup()
 
     @property
@@ -50,6 +52,8 @@ class WebServer:
         self.app.router.add_post("/api/web3/disconnect", self._web3_disconnect)
         self.app.router.add_get("/api/web3/balances", self._web3_balances)
         self.app.router.add_get("/api/chart/{symbol}", self._chart)
+        self.app.router.add_get("/api/wallet/scan", self._wallet_scan)
+        self.app.router.add_get("/api/wallet/targets", self._wallet_targets)
 
     async def _index(self, req):
         f = _STATIC / "index.html"
@@ -79,7 +83,6 @@ class WebServer:
     async def _chart(self, req):
         symbol = req.match_info["symbol"].upper()
         prices = self.orch.risk.portfolio_heat._prices
-        # Build candles from price history (simplified — last 200 ticks)
         hist = list(prices.get(symbol, []))
         if not hist or len(hist) < 2:
             return web.json_response({"candles": []})
@@ -89,6 +92,49 @@ class WebServer:
             t = int(time.time() // 15 * 15) - (len(hist) - i) * 15
             candles.append({"t": t, "o": p, "h": p, "l": p, "c": p})
         return web.json_response({"candles": candles})
+
+    async def _wallet_scan(self, req):
+        """Full wallet scan: discover ALL tokens across ALL chains."""
+        address = req.query.get("address", "")
+        if not address:
+            return web.json_response({"error": "provide ?address=0x..."}, status=400)
+        chains = req.query.get("chains", "ethereum,polygon,bsc,arbitrum,base,optimism").split(",")
+        holdings = await self._scanner.scan_wallet(address, chains)
+        return web.json_response({
+            "address": address,
+            "total_tokens": len(holdings),
+            "total_usd_value": round(sum(h.usd_value for h in holdings), 2),
+            "holdings": [
+                {
+                    "chain": h.chain, "symbol": h.symbol, "balance": round(h.balance, 6),
+                    "usd_price": round(h.usd_price, 4), "usd_value": round(h.usd_value, 2),
+                    "tradeable": h.tradeable, "rank_score": round(h.rank_score, 1),
+                    "contract": h.contract[:12] + "..." if h.contract else "",
+                }
+                for h in holdings
+            ],
+        })
+
+    async def _wallet_targets(self, req):
+        """Return the best tokens to trade from connected wallets."""
+        address = req.query.get("address", "")
+        if not address:
+            # Use first connected wallet
+            wallets = self._web3.list_wallets()
+            if not wallets:
+                return web.json_response({"targets": [], "msg": "No wallet connected"})
+            address = wallets[0]["address"]
+        holdings = await self._scanner.scan_wallet(address)
+        targets = self._scanner.get_best_trade_targets(holdings, max_n=5)
+        return web.json_response({
+            "address": address,
+            "targets": [
+                {"chain": t.chain, "symbol": t.symbol, "usd_value": round(t.usd_value, 2),
+                 "rank_score": round(t.rank_score, 1)}
+                for t in targets
+            ],
+            "msg": f"Top {len(targets)} trade targets from {len(holdings)} holdings",
+        })
 
     # ===== WEB3 =====
     async def _web3_status(self, req):
