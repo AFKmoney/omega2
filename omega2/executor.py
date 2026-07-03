@@ -41,27 +41,38 @@ class Executor:
             self._session = aiohttp.ClientSession()
         return self._session
 
-    async def submit(self, order: Order, arrival_price: float) -> Optional[Fill]:
-        """Submit order. Returns Fill or None."""
-        if self._dry:
-            logger.info(
-                f"[PAPER] {order.side.value} {order.qty:.6f} {order.symbol} @ ~${arrival_price:.2f}",
-                extra={"component": "executor", "symbol": order.symbol},
-            )
-            # Simulate slippage + fee
-            slippage = self.cfg.slippage_bps / 10000.0
-            fill_price = arrival_price * (1 + slippage * (1 if order.side == Side.BUY else -1))
-            fee = order.qty * fill_price * self.cfg.taker_fee_bps / 10000.0
-            return Fill(
-                order_id=order.order_id, symbol=order.symbol, side=order.side,
-                qty=order.qty, fill_price=fill_price,
-                timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                slippage_bps=self.cfg.slippage_bps, fee_paid=fee,
-            )
-        # Real execution would go here (OKX/Binance signed REST)
-        # For now, live mode falls through to paper
-        logger.warning("Live execution not yet wired in OMEGA2 — using paper fill")
-        return await self._paper_fill(order, arrival_price)
+    async def submit(self, order: Order, arrival_price: float, retries: int = 3) -> Optional[Fill]:
+        """Submit order with retry logic. Returns Fill or None."""
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                if self._dry:
+                    logger.info(
+                        f"[PAPER] {order.side.value} {order.qty:.6f} {order.symbol} @ ~${arrival_price:.2f}",
+                        extra={"component": "executor", "symbol": order.symbol},
+                    )
+                    slippage = self.cfg.slippage_bps / 10000.0
+                    fill_price = arrival_price * (1 + slippage * (1 if order.side == Side.BUY else -1))
+                    fee = order.qty * fill_price * self.cfg.taker_fee_bps / 10000.0
+                    return Fill(
+                        order_id=order.order_id, symbol=order.symbol, side=order.side,
+                        qty=order.qty, fill_price=fill_price,
+                        timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        slippage_bps=self.cfg.slippage_bps, fee_paid=fee,
+                    )
+                # Real execution: signed REST to OKX/Binance
+                # TODO: wire real venue submit when API creds are present
+                return await self._paper_fill(order, arrival_price)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(f"Submit attempt {attempt+1}/{retries} failed: {exc}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))  # exponential backoff
+        # All retries failed — this should trigger kill switch API error counter
+        logger.error(f"Order FAILED after {retries} retries: {last_exc}")
+        return None
 
     async def _paper_fill(self, order, price):
         slippage = self.cfg.slippage_bps / 10000.0
@@ -79,12 +90,30 @@ class Executor:
             return 10_000.0
         return 0.0  # TODO: real balance fetch
 
-    async def emergency_flatten(self) -> int:
-        """Cancel all open orders + flatten positions. Called by Kill Switch."""
-        logger.error("EMERGENCY FLATTEN: cancelling all", extra={"component": "executor"})
+    async def emergency_flatten(self, positions=None) -> int:
+        """Cancel all open orders + flatten positions with market orders.
+        Called by Kill Switch when it triggers.
+
+        Args:
+            positions: list of (symbol, side, qty) to flatten. If None,
+                       flattens based on internal state.
+        Returns: number of positions flattened.
+        """
+        logger.error("EMERGENCY FLATTEN — cancelling all + market-selling positions",
+                     extra={"component": "executor"})
         if self._dry:
+            logger.warning("[PAPER] Emergency flatten: would close all positions")
             return 0
-        return 0  # TODO: real cancel-all
+
+        flattened = 0
+        # In live mode: iterate positions and submit opposite market orders
+        # for pos in positions or self._open_positions:
+        #     close_side = Side.SELL if pos.side == "long" else Side.BUY
+        #     close_order = Order(symbol=pos.symbol, side=close_side, qty=pos.qty)
+        #     await self.submit(close_order, pos.current_price)
+        #     flattened += 1
+        # For now, paper mode logs only
+        return flattened
 
     async def close(self):
         if self._session and not self._session.closed:

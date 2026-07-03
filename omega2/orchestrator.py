@@ -19,6 +19,7 @@ from omega2.crowd import CrowdEngine
 from omega2.executor import Executor
 from omega2.feeds import BinanceFeed
 from omega2.risk import RiskEngine
+from omega2.monitor import Monitor
 
 logger = get_logger("omega2.orchestrator")
 
@@ -45,6 +46,8 @@ class Orchestrator:
         self.risk = RiskEngine(self.cfg)
         # Layer 5: Execution
         self.executor = Executor(self.cfg)
+        # Monitor (alerting)
+        self.monitor = Monitor()
         # State
         self._running = False
         self._signals = 0
@@ -92,6 +95,9 @@ class Orchestrator:
         """Process one market event through the full pipeline."""
         # 1. Feed risk engine (ATR, kill switch, portfolio heat)
         self.risk.update_market(event.symbol, event.last_price)
+        # Check for alerts every 50 bars
+        if self._signals % 50 == 0:
+            self.monitor.check_and_alert(self.risk.stats())
 
         # 2. Crowd engine
         crowd = self.crowd.compute(event.symbol, event.timestamp)

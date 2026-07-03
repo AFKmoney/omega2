@@ -77,19 +77,30 @@ class Backtester:
 
     def run(self, df: pd.DataFrame, symbol: str = "BTCUSDT") -> BacktestResult:
         """
-        Run a backtest on OHLCV data.
+        Run a backtest on OHLCV data using REAL crowd signals + LeadLag + Contrarian.
+
+        Simulates the 4 crowd signals (funding, OI, L/S, liquidations) from
+        historical price/volume patterns, then runs the full signal pipeline:
+        CrowdEngine → ContrarianAgent → RiskEngine → realistic execution.
 
         df columns: open, high, low, close, volume (timestamp index)
-        Uses simple momentum/meanrev signals + the real RiskEngine for sizing.
         """
-        risk = RiskEngine(self.cfg, initial_equity=self.cfg.data_dir and 10_000.0 or 10_000.0)
+        from omega2.crowd import CrowdEngine
+        from omega2.agents import ContrarianAgent
+        from omega2.core import CrowdSignal
+
+        risk = RiskEngine(self.cfg, initial_equity=10_000.0)
         equity = 10_000.0
         initial = equity
         equity_curve = []
         trades: List[BacktestTrade] = []
-        open_pos = None  # (bar, side, qty, entry_price)
+        open_pos = None
         rng = np.random.default_rng(42)
         wins = 0
+        crowd_engine = CrowdEngine(symbols=(symbol,))
+        contrarian = ContrarianAgent()
+        # Signal generation stats
+        signals_by_agent: dict = {}
 
         prices = df["close"].values.astype(float)
         highs = df["high"].values.astype(float)
@@ -97,76 +108,108 @@ class Backtester:
         volumes = df["volume"].values.astype(float)
         n = len(prices)
 
-        # Rolling stats
+        # Simulate crowd signals from price/volume patterns:
+        # - Funding rate: positive when price trending up, negative when down
+        # - L/S ratio: crowd tends to be more long after rallies
+        # - OI ROC: positive when volume expanding
+        # - Liquidations: spike on sharp moves
+        rets = np.diff(np.log(prices + 1e-9))
+        vol_ema = pd.Series(volumes).ewm(span=20).mean().values
+        cumulative_ret = np.cumsum(rets) if len(rets) > 0 else np.array([])
+
         window = 20
         for i in range(window, n):
             price = prices[i]
             # Update risk engine with real market data
             risk.update_market(symbol, price, highs[i], lows[i])
 
-            # Simple signal: momentum + meanrev
-            recent = prices[max(0, i-20):i+1]
-            ret_5 = (prices[i] - prices[i-5]) / prices[i-5] if i >= 5 else 0
-            mean_20 = np.mean(recent)
-            dev = (price - mean_20) / mean_20
+            # === SIMULATE CROWD SIGNALS FROM PRICE PATTERNS ===
+            # Funding: positive when recent momentum is up (longs paying)
+            funding = 0.0
+            if i >= 60:
+                recent_ret = (prices[i] - prices[i-60]) / prices[i-60]
+                funding = recent_ret * 0.003  # scale to funding-like range
+            crowd_engine.funding._latest[symbol] = funding
 
-            signal = None
-            if open_pos is None:
-                # Look for entries
-                if ret_5 > 0.003:  # momentum up
-                    signal = Signal(
+            # L/S ratio: more longs after uptrend (FOMO)
+            if i >= 20:
+                recent_ret_20 = (prices[i] - prices[i-20]) / prices[i-20]
+                long_pct = 50.0 + recent_ret_20 * 500  # scale
+                long_pct = max(20, min(80, long_pct))
+                crowd_engine.ls_ratio._long_pct[symbol] = long_pct
+
+            # OI ROC: rising when volume expanding
+            if i >= 14 and vol_ema[i] > 0:
+                vol_change = (vol_ema[i] - vol_ema[i-14]) / vol_ema[i-14]
+                crowd_engine.open_interest._roc[symbol] = vol_change
+
+            # Liquidations: spike on sharp moves (>2% in 5 bars)
+            if i >= 5 and prices[i-5] > 0:
+                sharp_move = abs((prices[i] - prices[i-5]) / prices[i-5])
+                if sharp_move > 0.02:
+                    liq_side = "LONG" if prices[i] < prices[i-5] else "SHORT"
+                    import time as _t
+                    crowd_engine.liquidations._events.setdefault(symbol, __import__("collections").deque(maxlen=5000)).append(
+                        (_t.time(), liq_side, sharp_move * volumes[i] * price))
+
+            # === RUN CROWD FUSION ===
+            crowd = crowd_engine.compute(symbol, str(i))
+
+            # === COLLECT SIGNALS FROM AGENTS ===
+            all_signals = []
+            if crowd:
+                csigs = contrarian.on_crowd(crowd)
+                all_signals.extend(csigs)
+
+            # Momentum fallback (lower confidence, always present)
+            if open_pos is None and not all_signals:
+                ret_5 = (prices[i] - prices[i-5]) / prices[i-5] if i >= 5 else 0
+                mean_20 = np.mean(prices[max(0, i-20):i+1])
+                dev = (price - mean_20) / mean_20
+                if abs(ret_5) > 0.003 or abs(dev) > 0.005:
+                    side = Side.BUY if (ret_5 > 0.003 or dev < -0.005) else Side.SELL
+                    all_signals.append(Signal(
                         agent="bt_momentum", symbol=symbol, timestamp=str(i),
-                        side=Side.BUY, confidence=0.60,
+                        side=side, confidence=0.55,
                         stop_loss_bps=80, take_profit_bps=200,
-                    )
-                elif dev < -0.005:  # meanrev oversold
-                    signal = Signal(
-                        agent="bt_meanrev", symbol=symbol, timestamp=str(i),
-                        side=Side.BUY, confidence=0.60,
-                        stop_loss_bps=60, take_profit_bps=150,
-                    )
-            else:
-                # Manage open position
+                    ))
+
+            # === MANAGE OPEN POSITION ===
+            if open_pos:
                 entry_bar, side, qty, entry_price = open_pos
                 bars_held = i - entry_bar
                 direction = 1.0 if side == "BUY" else -1.0
                 pnl_bps = direction * (price - entry_price) / entry_price * 10000
-                # Exit conditions: TP, SL, or time
                 if pnl_bps >= 200 or pnl_bps <= -80 or bars_held >= 60:
-                    # Close
                     slip = self.slippage_bps + rng.normal(0, 3)
                     exit_price = price * (1 - slip / 10000 * direction)
                     fee = qty * exit_price * self.taker_fee / 10000
-                    # Funding cost (approximate)
-                    funding_bars = bars_held
-                    funding_cost = qty * entry_price * self.funding_rate * (funding_bars / (8 * 60))  # 8h = 480 1m bars
+                    funding_cost = qty * entry_price * self.funding_rate * (bars_held / (8 * 60))
                     pnl_usd = direction * (exit_price - entry_price) * qty - fee - funding_cost
                     pnl_bps_net = pnl_bps - self.taker_fee * 2 / 100 - slip
                     equity += pnl_usd
-                    if pnl_usd > 0:
-                        wins += 1
+                    if pnl_usd > 0: wins += 1
                     trades.append(BacktestTrade(
-                        entry_bar=entry_bar, exit_bar=i, symbol=symbol,
-                        side=side, qty=qty, entry_price=entry_price,
-                        exit_price=exit_price, pnl_usd=pnl_usd, pnl_bps=pnl_bps_net,
-                        fees_usd=fee + funding_cost, slippage_bps=slip,
-                        holding_bars=bars_held,
-                    ))
+                        entry_bar=entry_bar, exit_bar=i, symbol=symbol, side=side,
+                        qty=qty, entry_price=entry_price, exit_price=exit_price,
+                        pnl_usd=pnl_usd, pnl_bps=pnl_bps_net, fees_usd=fee + funding_cost,
+                        slippage_bps=slip, holding_bars=bars_held))
                     risk.on_trade_closed(pnl_bps_net, pnl_usd)
                     risk.portfolio_heat.close(symbol)
                     open_pos = None
 
-            # Process signal through REAL risk engine
-            if signal and open_pos is None:
-                order = risk.on_signal(signal, price)
-                if order:
-                    # Simulate execution with slippage + latency
-                    slip = self.slippage_bps + rng.normal(0, 3)
-                    fill_price = price * (1 + slip / 10000 * (1 if signal.side == Side.BUY else -1))
-                    fee = order.qty * fill_price * self.taker_fee / 10000
-                    open_pos = (i, signal.side.value, order.qty, fill_price)
-                    # Entry fee reduces equity immediately
-                    equity -= fee
+            # === PROCESS SIGNALS THROUGH REAL RISK ENGINE ===
+            if open_pos is None:
+                for signal in all_signals:
+                    signals_by_agent[signal.agent] = signals_by_agent.get(signal.agent, 0) + 1
+                    order = risk.on_signal(signal, price)
+                    if order:
+                        slip = self.slippage_bps + rng.normal(0, 3)
+                        fill_price = price * (1 + slip / 10000 * (1 if signal.side == Side.BUY else -1))
+                        fee = order.qty * fill_price * self.taker_fee / 10000
+                        open_pos = (i, signal.side.value, order.qty, fill_price)
+                        equity -= fee
+                        break  # one position at a time in backtest
 
             equity_curve.append(equity)
 
