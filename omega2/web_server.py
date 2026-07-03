@@ -49,6 +49,7 @@ class WebServer:
         self.app.router.add_post("/api/web3/connect", self._web3_connect)
         self.app.router.add_post("/api/web3/disconnect", self._web3_disconnect)
         self.app.router.add_get("/api/web3/balances", self._web3_balances)
+        self.app.router.add_get("/api/chart/{symbol}", self._chart)
 
     async def _index(self, req):
         f = _STATIC / "index.html"
@@ -74,6 +75,20 @@ class WebServer:
     async def _markets(self, req):
         prices = self.orch.risk.portfolio_heat.last_prices
         return web.json_response({"prices": prices})
+
+    async def _chart(self, req):
+        symbol = req.match_info["symbol"].upper()
+        prices = self.orch.risk.portfolio_heat._prices
+        # Build candles from price history (simplified — last 200 ticks)
+        hist = list(prices.get(symbol, []))
+        if not hist or len(hist) < 2:
+            return web.json_response({"candles": []})
+        import time
+        candles = []
+        for i, p in enumerate(list(hist)[-200:]):
+            t = int(time.time() // 15 * 15) - (len(hist) - i) * 15
+            candles.append({"t": t, "o": p, "h": p, "l": p, "c": p})
+        return web.json_response({"candles": candles})
 
     # ===== WEB3 =====
     async def _web3_status(self, req):
