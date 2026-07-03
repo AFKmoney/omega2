@@ -315,7 +315,8 @@ async function poll(){
     const pnl=s.risk?.pnl_pct||0;
     $('m-pnl').textContent=(pnl>=0?'+':'')+pnl+'%';
     $('m-pnl').className='m '+(pnl>=0?'pos':'neg');
-    $('m-cr').textContent=s.crowd?.events_emitted||0>0?(s.risk?.crowd_regime||'neutral'):'neutral';
+    $('m-cr').textContent=(s.crowd&&(s.crowd.events_emitted||0)>0)?(s.crowd.regime_hint||'neutral'):'neutral';
+    $('m-crs').textContent=(s.crowd?.events_emitted||0)+' events';
     if(s.running){$('dot').className='dot live';$('dt').textContent='LIVE'}
     else{$('dot').className='dot idle';$('dt').textContent='IDLE'}
     if((s.signals||0)>lastSig||(s.fills||0)>lastFill){lastSig=s.signals||0;lastFill=s.fills||0;loadFeed()}
@@ -330,8 +331,6 @@ async function poll(){
   try{const c=await api('GET','/api/crowd');renderCrowd(c)}catch(e){}
   try{const r=await api('GET','/api/risk');renderRisk(r)}catch(e){}
 }
-setInterval(poll,2000);
-setInterval(loadChart,5000);
 
 // CROWD
 function renderCrowd(c){
@@ -444,6 +443,9 @@ async function loadW3B(){
 }
 async function discW3(a){await api('POST','/api/web3/disconnect',{address:a});toast('Disconnected');loadW3S();loadW3B()}
 
-// INIT
-initChart();loadChart();poll();loadFeed();
+// INIT — poll FIRST so metrics show even if chart fails
+poll();loadFeed();
+try{initChart();loadChart()}catch(e){console.log('Chart init deferred:',e)}
+setInterval(poll,2000);
+setInterval(()=>{try{loadChart()}catch(e){}},5000);
 </script></body></html>
