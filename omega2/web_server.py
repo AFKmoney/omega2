@@ -17,6 +17,7 @@ from omega2.core import load_config, get_logger
 from omega2.orchestrator import Orchestrator
 from omega2.web3 import Web3Manager
 from omega2.wallet_scanner import WalletScanner
+from omega2.dex_trader import DEXTrader
 
 logger = get_logger("omega2.web")
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -29,6 +30,7 @@ class WebServer:
         self._orch: Optional[Orchestrator] = None
         self._web3 = Web3Manager()
         self._scanner = WalletScanner()
+        self._dex = DEXTrader()
         self._setup()
 
     @property
@@ -54,6 +56,9 @@ class WebServer:
         self.app.router.add_get("/api/chart/{symbol}", self._chart)
         self.app.router.add_get("/api/wallet/scan", self._wallet_scan)
         self.app.router.add_get("/api/wallet/targets", self._wallet_targets)
+        # DEX trading
+        self.app.router.add_post("/api/dex/swap", self._dex_swap)
+        self.app.router.add_get("/api/dex/pending", self._dex_pending)
 
     async def _index(self, req):
         f = _STATIC / "index.html"
@@ -135,6 +140,29 @@ class WebServer:
             ],
             "msg": f"Top {len(targets)} trade targets from {len(holdings)} holdings",
         })
+
+    async def _dex_swap(self, req):
+        """Build a DEX swap tx for the user to sign in MetaMask."""
+        data = await req.json()
+        swap = self._dex.build_swap(
+            chain=data.get("chain", "ethereum"),
+            from_token_symbol=data.get("from_token", "USDC"),
+            to_token_symbol=data.get("to_token", "WETH"),
+            amount_in=float(data.get("amount", 100)),
+            slippage_bps=float(data.get("slippage_bps", 50)),
+        )
+        if swap is None:
+            return web.json_response({"ok": False, "error": "Cannot build swap"}, status=400)
+        return web.json_response({"ok": True, "swap": {
+            "chain": swap.chain, "from": swap.from_token, "to": swap.to_token,
+            "amount_in": swap.amount_in, "est_out": round(swap.estimated_amount_out, 6),
+            "min_out": round(swap.min_amount_out, 6), "router": swap.router_address,
+            "calldata": swap.calldata, "gas": swap.gas_estimate,
+        }})
+
+    async def _dex_pending(self, req):
+        """Return pending swaps for the frontend."""
+        return web.json_response({"swaps": self._dex.get_pending_swaps()})
 
     # ===== WEB3 =====
     async def _web3_status(self, req):

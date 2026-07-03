@@ -229,16 +229,25 @@ label{font-size:8px;color:var(--t3);display:block;margin-bottom:4px;text-transfo
 <div class="view" id="v-markets"><div class="card"><h3>Live Prices</h3><div id="prices"></div></div></div>
 
 <!-- WALLETS -->
-<div class="view" id="v-wallets"><div class="card"><h3>🦊 Connect Wallet</h3>
-  <div style="display:flex;gap:8px;margin-bottom:14px">
+<div class="view" id="v-wallets"><div class="card"><h3>🦊 Wallet Connect + DEX Trade</h3>
+  <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
     <button class="btn btn-go" onclick="connectMM()">🦊 MetaMask</button>
-    <button class="btn btn-go" onclick="connectMan()">📋 Manual</button></div>
+    <button class="btn btn-go" onclick="connectMan()">📋 Manual Address</button>
+    <button class="btn" onclick="loadW3S()">🔄 Refresh</button>
+  </div>
   <div class="fl"><div><label>Address (0x...)</label><input id="w3a" placeholder="0xAbc..."></div>
-    <div><label>Chain</label><select id="w3c"><option>ethereum</option><option>polygon</option><option>bsc</option><option>arbitrum</option><option>base</option><option>optimism</option></select></div>
-    <button class="btn" onclick="loadW3B()">Refresh</button></div>
+    <div><label>Chain</label><select id="w3c"><option>ethereum</option><option>polygon</option><option>bsc</option><option>arbitrum</option><option>base</option><option>optimism</option></select></div></div>
   <div id="w3s" style="margin-bottom:10px"></div>
   <div id="w3scan" style="margin-bottom:10px"></div>
   <div id="w3b"></div>
+</div>
+<div class="card" style="margin-top:14px"><h3>🔄 DEX Swap (Uniswap V3)</h3>
+  <div class="fl"><div><label>From Token</label><input id="dxf" value="USDC"></div>
+    <div><label>To Token</label><input id="dxt" value="WETH"></div>
+    <div><label>Amount</label><input id="dxa" type="number" value="100"></div></div>
+  <div class="fl"><div><label>Chain</label><select id="dxc"><option>ethereum</option><option>polygon</option><option>arbitrum</option><option>optimism</option><option>base</option></select></div>
+    <button class="btn btn-go" onclick="buildSwap()">⚡ Build Swap</button></div>
+  <div id="swapResult" style="margin-top:10px"></div>
 </div></div>
 
 <!-- SETTINGS -->
@@ -442,6 +451,54 @@ async function loadW3B(){
   if($('w3b'))$('w3b').innerHTML=h||'<div class="sub">No balances</div>';
 }
 async function discW3(a){await api('POST','/api/web3/disconnect',{address:a});toast('Disconnected');loadW3S();loadW3B()}
+
+// === DEX SWAP ===
+async function buildSwap(){
+  const ft=$('dxf').value,tt=$('dxt').value,amt=parseFloat($('dxa').value),ch=$('dxc').value;
+  if(!ft||!tt||!amt){toast('Fill all fields','err');return}
+  $('swapResult').innerHTML='<span class="spin"></span> Building swap...';
+  const r=await api('POST','/api/dex/swap',{from_token:ft,to_token:tt,amount:amt,chain:ch});
+  if(!r.ok){$('swapResult').innerHTML='<div class="sub" style="color:var(--rd)">'+(r.error||'Failed')+'</div>';return}
+  const s=r.swap;
+  let h=`<div style="padding:12px;background:rgba(0,240,160,.06);border-radius:10px;margin-bottom:8px">
+    <div style="font-size:13px;font-weight:700;margin-bottom:6px">⚡ Swap Ready</div>
+    <div class="sub">From: <b style="color:var(--t)">${s.amount_in} ${s.from}</b></div>
+    <div class="sub">To (est): <b style="color:var(--gr)">${s.est_out} ${s.to}</b></div>
+    <div class="sub">Min out: ${s.min_out} · Gas: ${s.gas} · Router: ${s.router.slice(0,10)}...</div></div>`;
+  // Execute button — sends via MetaMask
+  h+=`<button class="btn btn-go" onclick="executeSwap('${s.router}','${s.calldata}','${s.gas}')">🦊 Execute in MetaMask</button>`;
+  $('swapResult').innerHTML=h;
+  toast('Swap built — review and sign');
+}
+async function executeSwap(router,calldata,gas){
+  if(typeof window.ethereum==='undefined'){toast('Install MetaMask','err');return}
+  try{
+    const accounts=await window.ethereum.request({method:'eth_requestAccounts'});
+    const from=accounts[0];
+    const txParams={
+      from:from,
+      to:router,
+      data:calldata,
+      gasLimit:'0x'+parseInt(gas).toString(16),
+      value:'0x0',
+    };
+    // Get chain ID
+    const chainId=await window.ethereum.request({method:'eth_chainId'});
+    txParams.chainId=chainId;
+    const txHash=await window.ethereum.request({
+      method:'eth_sendTransaction',
+      params:[txParams],
+    });
+    toast('TX sent: '+txHash.slice(0,16)+'...');
+    $('swapResult').innerHTML='<div style="padding:12px;background:rgba(0,240,160,.08);border-radius:10px">'+
+      '<div style="font-size:13px;font-weight:700;color:var(--gr)">✓ Transaction Submitted</div>'+
+      '<div class="sub">Hash: '+txHash+'</div>'+
+      '<div class="sub">Track on etherscan.io/tx/'+txHash+'</div></div>';
+  }catch(e){
+    toast('Swap failed: '+e.message,'err');
+    $('swapResult').innerHTML='<div style="color:var(--rd)">'+e.message+'</div>';
+  }
+}
 
 // INIT — poll FIRST so metrics show even if chart fails
 poll();loadFeed();
